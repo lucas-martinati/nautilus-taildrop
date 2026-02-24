@@ -12,8 +12,9 @@ import time
 
 from gi.repository import GObject, Nautilus
 
-# Path to the tailscale binary — adjust if needed
-TAILSCALE_BIN = "/usr/bin/tailscale"
+import shutil as _shutil
+
+TAILSCALE_BIN: str = _shutil.which("tailscale") or "/usr/bin/tailscale"
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +59,8 @@ class Taildrop:
     @classmethod
     def _warn_missing(cls) -> None:
         if not cls._tailscale_missing_warned:
-            _notify("Tailscale introuvable",
-                    f"Binaire non trouvé : {TAILSCALE_BIN}",
+            _notify("Tailscale not found",
+                    f"Binary not found: {TAILSCALE_BIN}",
                     icon="dialog-error")
             cls._tailscale_missing_warned = True
 
@@ -87,17 +88,17 @@ class Taildrop:
                 timeout=5,              # avoid blocking Nautilus if Tailscale hangs
             )
         except subprocess.TimeoutExpired:
-            _notify("Tailscale", "Timeout lors de la récupération des appareils.",
+            _notify("Tailscale", "Timeout while retrieving devices.",
                     icon="dialog-warning")
             return cls._devices_cache
         except OSError as exc:
-            _notify("Tailscale Error", f"Impossible de lancer tailscale : {exc}",
+            _notify("Tailscale Error", f"Unable to launch tailscale: {exc}",
                     icon="dialog-error")
             return cls._devices_cache
 
         if process.returncode != 0:
-            error_msg = process.stderr.strip() or "Erreur inconnue"
-            _notify("Tailscale Error", f"Status error : {error_msg}",
+            error_msg = process.stderr.strip() or "Unknown error"
+            _notify("Tailscale Error", f"Status error: {error_msg}",
                     icon="dialog-error")
             # Don't wipe cache — stale is better than empty
             return cls._devices_cache
@@ -105,9 +106,12 @@ class Taildrop:
         try:
             status = json.loads(process.stdout)
         except json.JSONDecodeError as exc:
-            _notify("Tailscale Error", f"Réponse JSON invalide : {exc}",
+            _notify("Tailscale Error", f"Invalid JSON response: {exc}",
                     icon="dialog-error")
             return cls._devices_cache
+
+        # Only show peers belonging to the same user (important in shared/corp tailnets)
+        self_user_id = status.get("Self", {}).get("UserID")
 
         items = []
         for _key, data in status.get("Peer", {}).items():
@@ -115,10 +119,14 @@ class Taildrop:
             if data.get("HostName") == "funnel-ingress-node":
                 continue
 
+            # Skip peers that belong to other users (e.g. colleagues on a shared tailnet)
+            if self_user_id and data.get("UserID") != self_user_id:
+                continue
+
             dns = data.get("DNSName", "")
-            clean_name = dns.split(".")[0] if dns else data.get("HostName", "Inconnu")
+            clean_name = dns.split(".")[0] if dns else data.get("HostName", "Unknown")
             if not clean_name:
-                clean_name = "Inconnu"
+                clean_name = "Unknown"
 
             os_name    = data.get("OS", "")
             is_online  = data.get("Online", False)
@@ -139,6 +147,23 @@ class Taildrop:
         cls._tailscale_missing_warned = False   # reset warning flag after success
         return items
 
+    # ---------------------------------------------------------------- receiving
+
+    @staticmethod
+    def receive_files(dest_dir: str) -> None:
+        """Pull pending Taildrop files into *dest_dir* (fire-and-forget)."""
+        _notify("Tailscale", f"Receiving files in {dest_dir}…",
+                icon="network-receive")
+        cmd = [TAILSCALE_BIN, "file", "get", dest_dir]
+        try:
+            subprocess.run(
+                ["systemd-run", "--user", "--no-block"] + cmd,
+                check=False,
+                capture_output=True,
+            )
+        except FileNotFoundError:
+            subprocess.Popen(cmd, close_fds=True)
+
     # ----------------------------------------------------------------- sending
 
     @staticmethod
@@ -148,9 +173,9 @@ class Taildrop:
 
         if len(paths) == 1:
             filename = os.path.basename(paths[0])
-            message  = f"Envoi de « {filename} » vers {host}…"
+            message  = f"Sending '{filename}' to {host}…"
         else:
-            message = f"Envoi de {len(paths)} fichiers vers {host}…"
+            message = f"Sending {len(paths)} files to {host}…"
 
         _notify("Tailscale", message, icon="network-transmit")
 
@@ -191,7 +216,7 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                 paths.append(path)
 
         if not paths:
-            _notify("Tailscale", "Aucun fichier local sélectionné.",
+            _notify("Tailscale", "No local file selected.",
                     icon="dialog-warning")
             return
 
@@ -211,8 +236,8 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
 
         top = Nautilus.MenuItem(
             name="Taildrop::Main",
-            label="Envoyer avec Tailscale",
-            tip="Partager via Taildrop",
+            label="Send with Tailscale",
+            tip="Share via Taildrop",
             icon="network-transmit",
         )
         submenu = Nautilus.Menu()
@@ -237,7 +262,7 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
 
         refresh = Nautilus.MenuItem(
             name="Taildrop::Refresh",
-            label="🔄 Actualiser la liste",
+            label="🔄 Refresh the list",
         )
         refresh.connect("activate", lambda *_: Taildrop.invalidate_cache())
         submenu.append_item(refresh)
@@ -250,6 +275,26 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         """Called when right-clicking on selected files."""
         return self._build_menu(files)
 
-    def get_background_items(self, window, file):          # noqa: signature varies
-        """Called when right-clicking on the folder background — not needed."""
-        return []
+    def get_background_items(self, window_or_file, file=None):
+        """Right-click on the folder background → offer to receive pending files."""
+        # Nautilus passes either (window, file) or just (file,) depending on version.
+        folder = file if file is not None else window_or_file
+
+        item = Nautilus.MenuItem(
+            name="Taildrop::Receive",
+            label="📥 Receive with Tailscale",
+            tip="Retrieve pending Taildrop files in this folder",
+            icon="network-receive",
+        )
+
+        def _on_receive(_menu_item, f):
+            location = f.get_location()
+            dest = location.get_path() if location else None
+            if not dest:
+                _notify("Tailscale", "Unable to determine target folder.",
+                        icon="dialog-error")
+                return
+            Taildrop.receive_files(dest)
+
+        item.connect("activate", _on_receive, folder)
+        return [item]

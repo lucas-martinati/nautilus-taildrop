@@ -230,7 +230,8 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         # ── "Refresh" entry at the bottom ──────────────────────────────────
         sep = Nautilus.MenuItem(
             name="Taildrop::Sep",
-            label="─────────────",   # visual separator (Nautilus has no real separator)
+            label="─────────────",   # visual separator
+            sensitive=False,
         )
         submenu.append_item(sep)
 

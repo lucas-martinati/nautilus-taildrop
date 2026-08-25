@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """
-Taildrop — Nautilus extension to send files via Tailscale.
+Taildrop — Nautilus extension to send and receive files via Tailscale.
 Install: ~/.local/share/nautilus-python/extensions/taildrop.py
 Reload:  nautilus -q && nautilus &
 """
 
+from __future__ import annotations
+
 import json
 import os
+import shutil as _shutil
 import subprocess
+import threading
 import time
 
-from gi.repository import GObject, Nautilus
+import gi
+try:
+    gi.require_version('Nautilus', '4.0')
+except ValueError:
+    try:
+        gi.require_version('Nautilus', '3.0')
+    except ValueError:
+        pass
 
-import shutil as _shutil
+from gi.repository import GObject, Nautilus
 
 TAILSCALE_BIN: str = _shutil.which("tailscale") or "/usr/bin/tailscale"
 
@@ -21,23 +32,59 @@ TAILSCALE_BIN: str = _shutil.which("tailscale") or "/usr/bin/tailscale"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _notify(title: str, message: str, icon: str = "network-transmit") -> None:
-    """Fire-and-forget desktop notification (no zombie: double-fork via shell)."""
-    # Using 'systemd-run --user' avoids zombie processes without threads.
-    # Fallback to plain Popen if systemd-run is unavailable.
-    try:
-        subprocess.run(
-            ["systemd-run", "--user", "--no-block",
-             "notify-send", "-i", icon, title, message],
-            check=False,
-            capture_output=True,
-        )
-    except FileNotFoundError:
-        # systemd-run not available — plain Popen (rare zombie risk but harmless)
-        subprocess.Popen(
-            ["notify-send", "-i", icon, title, message],
-            close_fds=True,
-        )
+def _copy_to_clipboard(text: str) -> None:
+    """Copy text to clipboard supporting Wayland and X11."""
+    if not text:
+        return
+
+    # Wayland
+    if _shutil.which("wl-copy") and ("WAYLAND_DISPLAY" in os.environ or os.environ.get("XDG_SESSION_TYPE") == "wayland"):
+        try:
+            subprocess.run(["wl-copy"], input=text, text=True, check=True)
+            return
+        except Exception:
+            pass
+
+    # X11
+    if _shutil.which("xclip"):
+        try:
+            subprocess.run(["xclip", "-selection", "clipboard"], input=text, text=True, check=True)
+            return
+        except Exception:
+            pass
+
+    if _shutil.which("xsel"):
+        try:
+            subprocess.run(["xsel", "--clipboard", "--input"], input=text, text=True, check=True)
+            return
+        except Exception:
+            pass
+
+
+def _notify(title: str, message: str, icon: str = "network-transmit", copy_content: str | None = None) -> None:
+    """Desktop notification. If copy_content is provided, clicking the notification copies it to clipboard."""
+    def _worker():
+        cmd = ["notify-send", "-a", "Taildrop", "-i", icon, title, message]
+        if copy_content:
+            cmd.extend([
+                "--action=default=Copy error",
+                "--action=copy=📋 Copy error",
+            ])
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                action = res.stdout.strip()
+                if action in ("default", "copy", "0", "1"):
+                    _copy_to_clipboard(copy_content)
+                    _notify("Tailscale", "Error copied to clipboard!", icon="edit-copy")
+            except FileNotFoundError:
+                pass
+        else:
+            try:
+                subprocess.Popen(cmd, close_fds=True)
+            except FileNotFoundError:
+                pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _tailscale_available() -> bool:
@@ -45,13 +92,15 @@ def _tailscale_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Device cache + sending logic
+# Device cache + sending/receiving logic
 # ---------------------------------------------------------------------------
 
 class Taildrop:
     _devices_cache: list = []
     _last_cache_time: float = 0.0
-    _CACHE_TTL: int = 15          # seconds — menu opens instantly thanks to this
+    _CACHE_TTL: int = 20          # seconds
+    _is_updating: bool = False
+    _lock = threading.Lock()
     _tailscale_missing_warned: bool = False
 
     # ------------------------------------------------------------------ cache
@@ -59,137 +108,235 @@ class Taildrop:
     @classmethod
     def _warn_missing(cls) -> None:
         if not cls._tailscale_missing_warned:
+            err_msg = f"Binary not found: {TAILSCALE_BIN}"
             _notify("Tailscale not found",
-                    f"Binary not found: {TAILSCALE_BIN}",
-                    icon="dialog-error")
+                    err_msg,
+                    icon="dialog-error",
+                    copy_content=err_msg)
             cls._tailscale_missing_warned = True
 
     @classmethod
-    def invalidate_cache(cls) -> None:
-        """Force a refresh on the next get_devices() call."""
-        cls._last_cache_time = 0.0
+    def _fetch_devices(cls) -> None:
+        """Fetch devices from Tailscale CLI and populate the cache."""
+        with cls._lock:
+            try:
+                if not _tailscale_available():
+                    cls._warn_missing()
+                    return
+
+                try:
+                    process = subprocess.run(
+                        [TAILSCALE_BIN, "status", "--json"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=8,
+                    )
+                except subprocess.TimeoutExpired:
+                    err_msg = "Timeout while retrieving devices."
+                    _notify("Tailscale", err_msg,
+                            icon="dialog-warning",
+                            copy_content=err_msg)
+                    return
+                except OSError as exc:
+                    err_msg = f"Unable to launch tailscale: {exc}"
+                    _notify("Tailscale Error", err_msg,
+                            icon="dialog-error",
+                            copy_content=err_msg)
+                    return
+
+                if process.returncode != 0:
+                    error_msg = process.stderr.strip() or "Unknown status error"
+                    _notify("Tailscale Error", f"Status error: {error_msg}",
+                            icon="dialog-error",
+                            copy_content=error_msg)
+                    return
+
+                try:
+                    status = json.loads(process.stdout)
+                except json.JSONDecodeError as exc:
+                    err_msg = f"Invalid JSON response: {exc}"
+                    _notify("Tailscale Error", err_msg,
+                            icon="dialog-error",
+                            copy_content=err_msg)
+                    return
+
+                # Only show peers belonging to the same user (important in shared/corp tailnets)
+                self_user_id = status.get("Self", {}).get("UserID")
+
+                items = []
+                for _key, data in status.get("Peer", {}).items():
+                    # Skip Tailscale internal nodes
+                    if data.get("HostName") == "funnel-ingress-node":
+                        continue
+
+                    # Skip peers that belong to other users (e.g. colleagues on a shared tailnet)
+                    if self_user_id and data.get("UserID") != self_user_id:
+                        continue
+
+                    dns = data.get("DNSName", "").rstrip(".")
+                    dns_name = dns.split(".")[0] if dns else ""
+                    host_name = data.get("HostName", "")
+                    clean_name = host_name or dns_name or "Unknown"
+
+                    # Prefer full MagicDNS name to avoid hostname collision between identical devices
+                    target = dns if dns else (dns_name or host_name or "Unknown")
+
+                    os_name = data.get("OS", "")
+                    is_online = data.get("Online", False)
+                    status_icon = "🟢" if is_online else "🔴"
+                    os_part = f" ({os_name})" if os_name else ""
+
+                    items.append({
+                        "target": target,
+                        "hostname": clean_name,
+                        "label": f"{status_icon} {clean_name}{os_part}",
+                        "is_online": is_online,
+                    })
+
+                # Online first, then alphabetical
+                items.sort(key=lambda x: (not x["is_online"], x["hostname"].lower()))
+
+                cls._devices_cache = items
+                cls._last_cache_time = time.monotonic()
+                cls._tailscale_missing_warned = False
+            finally:
+                cls._is_updating = False
 
     @classmethod
     def get_devices(cls) -> list:
-        now = time.monotonic()           # monotonic: immune to clock adjustments
-        if now - cls._last_cache_time < cls._CACHE_TTL and cls._devices_cache:
+        now = time.monotonic()
+        # If cache is completely empty, fetch synchronously so devices appear on first click
+        if not cls._devices_cache:
+            cls._fetch_devices()
             return cls._devices_cache
 
-        if not _tailscale_available():
-            cls._warn_missing()
-            return cls._devices_cache   # return stale cache rather than nothing
+        # Stale-while-revalidate: return cache immediately and refresh asynchronously if expired
+        if (now - cls._last_cache_time >= cls._CACHE_TTL) and not cls._is_updating:
+            cls._is_updating = True
+            threading.Thread(target=cls._fetch_devices, daemon=True).start()
 
-        try:
-            process = subprocess.run(
-                [TAILSCALE_BIN, "status", "--json"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=5,              # avoid blocking Nautilus if Tailscale hangs
-            )
-        except subprocess.TimeoutExpired:
-            _notify("Tailscale", "Timeout while retrieving devices.",
-                    icon="dialog-warning")
-            return cls._devices_cache
-        except OSError as exc:
-            _notify("Tailscale Error", f"Unable to launch tailscale: {exc}",
-                    icon="dialog-error")
-            return cls._devices_cache
+        return cls._devices_cache
 
-        if process.returncode != 0:
-            error_msg = process.stderr.strip() or "Unknown error"
-            _notify("Tailscale Error", f"Status error: {error_msg}",
-                    icon="dialog-error")
-            # Don't wipe cache — stale is better than empty
-            return cls._devices_cache
-
-        try:
-            status = json.loads(process.stdout)
-        except json.JSONDecodeError as exc:
-            _notify("Tailscale Error", f"Invalid JSON response: {exc}",
-                    icon="dialog-error")
-            return cls._devices_cache
-
-        # Only show peers belonging to the same user (important in shared/corp tailnets)
-        self_user_id = status.get("Self", {}).get("UserID")
-
-        items = []
-        for _key, data in status.get("Peer", {}).items():
-            # Skip Tailscale internal nodes
-            if data.get("HostName") == "funnel-ingress-node":
-                continue
-
-            # Skip peers that belong to other users (e.g. colleagues on a shared tailnet)
-            if self_user_id and data.get("UserID") != self_user_id:
-                continue
-
-            dns = data.get("DNSName", "")
-            clean_name = dns.split(".")[0] if dns else data.get("HostName", "Unknown")
-            if not clean_name:
-                clean_name = "Unknown"
-
-            os_name    = data.get("OS", "")
-            is_online  = data.get("Online", False)
-            status_icon = "🟢" if is_online else "🔴"
-            os_part     = f" ({os_name})" if os_name else ""
-
-            items.append({
-                "hostname":  clean_name,
-                "label":     f"{status_icon} {clean_name}{os_part}",
-                "is_online": is_online,
-            })
-
-        # Online first, then alphabetical
-        items.sort(key=lambda x: (not x["is_online"], x["hostname"].lower()))
-
-        cls._devices_cache    = items
-        cls._last_cache_time  = now
-        cls._tailscale_missing_warned = False   # reset warning flag after success
-        return items
+    @classmethod
+    def invalidate_cache(cls) -> None:
+        """Force a refresh and trigger immediate background fetch."""
+        cls._last_cache_time = 0.0
+        cls._is_updating = True
+        _notify("Tailscale", "Refreshing device list…", icon="view-refresh")
+        threading.Thread(target=cls._fetch_devices, daemon=True).start()
 
     # ---------------------------------------------------------------- receiving
 
     @staticmethod
     def receive_files(dest_dir: str) -> None:
-        """Pull pending Taildrop files into *dest_dir* (fire-and-forget)."""
-        _notify("Tailscale", f"Receiving files in {dest_dir}…",
+        """Pull pending Taildrop files into *dest_dir* asynchronously with feedback."""
+        folder_name = os.path.basename(dest_dir) or dest_dir
+        _notify("Tailscale", f"Receiving files in {folder_name}…",
                 icon="network-receive")
-        cmd = [TAILSCALE_BIN, "file", "get", dest_dir]
-        try:
-            subprocess.run(
-                ["systemd-run", "--user", "--no-block"] + cmd,
-                check=False,
-                capture_output=True,
-            )
-        except FileNotFoundError:
-            subprocess.Popen(cmd, close_fds=True)
+
+        def _receive_worker():
+            cmd = [TAILSCALE_BIN, "file", "get", dest_dir]
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+            except subprocess.TimeoutExpired:
+                err_msg = "Timeout while checking for incoming files."
+                _notify("Tailscale Error", err_msg, icon="dialog-warning", copy_content=err_msg)
+                return
+
+            if res.returncode == 0:
+                _notify("Tailscale", f"Files received in {folder_name}!",
+                        icon="emblem-default")
+            else:
+                raw_err = (res.stderr or res.stdout or "").strip()
+                err = raw_err or "No pending files or Tailscale error."
+                _notify("Tailscale", err, icon="dialog-warning", copy_content=err)
+
+        threading.Thread(target=_receive_worker, daemon=True).start()
 
     # ----------------------------------------------------------------- sending
 
     @staticmethod
-    def send_files(paths: list[str], host: str) -> None:
+    def send_files(paths: list[str], target: str, display_name: str) -> None:
+        """Send files to target peer asynchronously with bounded timeout and immediate error notification."""
         if not paths:
             return
 
-        if len(paths) == 1:
-            filename = os.path.basename(paths[0])
-            message  = f"Sending '{filename}' to {host}…"
+        valid_paths = [p for p in paths if os.path.exists(p)]
+        if not valid_paths:
+            _notify("Tailscale", "No valid local file selected.", icon="dialog-warning")
+            return
+
+        count = len(valid_paths)
+        if count == 1:
+            filename = os.path.basename(valid_paths[0])
+            message = f"Sending '{filename}' to {display_name}…"
         else:
-            message = f"Sending {len(paths)} files to {host}…"
+            message = f"Sending {count} files to {display_name}…"
 
         _notify("Tailscale", message, icon="network-transmit")
 
-        # Fire-and-forget via systemd-run (no threads, no zombies)
-        cmd = [TAILSCALE_BIN, "file", "cp"] + paths + [f"{host}:"]
-        try:
-            subprocess.run(
-                ["systemd-run", "--user", "--no-block"] + cmd,
-                check=False,
-                capture_output=True,
-            )
-        except FileNotFoundError:
-            # systemd-run unavailable — fall back to plain Popen
-            subprocess.Popen(cmd, close_fds=True)
+        def _send_worker():
+            # Dynamic timeout: minimum 15 seconds, + 1s per 2 MB payload
+            try:
+                total_size = sum(os.path.getsize(p) for p in valid_paths if os.path.isfile(p))
+            except Exception:
+                total_size = 0
+            timeout_sec = max(15, int(total_size / (2 * 1024 * 1024)) + 15)
+
+            cmd = [TAILSCALE_BIN, "file", "cp"] + valid_paths + [f"{target}:"]
+            try:
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout_sec,
+                )
+            except subprocess.TimeoutExpired:
+                err_msg = f"{display_name} did not respond within {timeout_sec}s (device may be asleep or offline)."
+                _notify(
+                    "Tailscale Error",
+                    f"Timeout: {display_name} is not responding (offline or sleep mode).",
+                    icon="dialog-error",
+                    copy_content=f"Tailscale timeout sending to {display_name} ({target}): {err_msg}",
+                )
+                return
+            except Exception as exc:
+                _notify(
+                    "Tailscale Error",
+                    f"Failed to launch transfer: {exc}",
+                    icon="dialog-error",
+                    copy_content=str(exc),
+                )
+                return
+
+            if res.returncode == 0:
+                _notify("Tailscale", f"Successfully sent files to {display_name}!",
+                        icon="emblem-default")
+            else:
+                raw_err = (res.stderr or res.stdout or "").strip()
+                # Clean up terminal progress lines
+                err_lines = [
+                    line.strip() for line in raw_err.splitlines()
+                    if line.strip() and not ("0.00B" in line or "ETA" in line)
+                ]
+                clean_err = " | ".join(err_lines) if err_lines else "Device unreachable or connection failed"
+
+                if "reportedly offline" in clean_err.lower():
+                    user_msg = f"{display_name} is offline or unreachable."
+                else:
+                    user_msg = clean_err
+
+                full_error = f"Tailscale error sending to {display_name} ({target}): {clean_err}"
+                _notify(
+                    "Tailscale Error",
+                    f"Failed to send to {display_name}: {user_msg}",
+                    icon="dialog-error",
+                    copy_content=full_error,
+                )
+
+        threading.Thread(target=_send_worker, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +351,7 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
     # -------------------------------------------------------------- callback
 
     @staticmethod
-    def _on_activate(_menu_item, hostname: str, files) -> None:
+    def _on_activate(_menu_item, target: str, display_name: str, files) -> None:
         paths = []
         for f in files:
             location = f.get_location()
@@ -220,7 +367,7 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
                     icon="dialog-warning")
             return
 
-        Taildrop.send_files(paths, hostname)
+        Taildrop.send_files(paths, target, display_name)
 
     # ----------------------------------------------------------- menu builder
 
@@ -244,12 +391,13 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         top.set_submenu(submenu)
 
         for device in devices:
+            safe_name = str(device["hostname"]).replace(" ", "_")
             item = Nautilus.MenuItem(
-                name=f'Taildrop::Device_{device["hostname"]}',
+                name=f'Taildrop::Device_{safe_name}',
                 label=device["label"],
             )
             item.connect("activate", TaildropMenuProvider._on_activate,
-                         device["hostname"], files)
+                         device["target"], device["hostname"], files)
             submenu.append_item(item)
 
         # ── "Refresh" entry at the bottom ──────────────────────────────────
@@ -262,7 +410,7 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
 
         refresh = Nautilus.MenuItem(
             name="Taildrop::Refresh",
-            label="🔄 Refresh the list",
+            label="🔄 Refresh device list",
         )
         refresh.connect("activate", lambda *_: Taildrop.invalidate_cache())
         submenu.append_item(refresh)
@@ -288,7 +436,7 @@ class TaildropMenuProvider(GObject.GObject, Nautilus.MenuProvider):
         )
 
         def _on_receive(_menu_item, f):
-            location = f.get_location()
+            location = f.get_location() if f else None
             dest = location.get_path() if location else None
             if not dest:
                 _notify("Tailscale", "Unable to determine target folder.",

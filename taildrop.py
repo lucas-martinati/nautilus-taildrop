@@ -116,12 +116,19 @@ class Taildrop:
             cls._tailscale_missing_warned = True
 
     @classmethod
-    def _fetch_devices(cls) -> None:
-        """Fetch devices from Tailscale CLI and populate the cache."""
+    def _fetch_devices(cls, notify_on_error: bool = False) -> None:
+        """Fetch devices from Tailscale CLI and populate the cache.
+
+        Appelé en arrière-plan à chaque clic droit (stale-while-revalidate),
+        donc les erreurs doivent rester silencieuses par défaut pour ne pas
+        spammer l'utilisateur qui n'utilise pas Tailscale. Seul un refresh
+        explicite (menu Refresh) passe notify_on_error=True.
+        """
         with cls._lock:
             try:
                 if not _tailscale_available():
-                    cls._warn_missing()
+                    if notify_on_error:
+                        cls._warn_missing()
                     return
 
                 try:
@@ -133,32 +140,38 @@ class Taildrop:
                         timeout=8,
                     )
                 except subprocess.TimeoutExpired:
-                    err_msg = "Timeout while retrieving devices."
-                    _notify("Tailscale", err_msg,
-                            icon="dialog-warning",
-                            copy_content=err_msg)
+                    # Silencieux en usage normal : tailscaled arrêté / en veille
+                    # ne doit pas notifier si l'utilisateur ne s'en sert pas.
+                    if notify_on_error:
+                        err_msg = "Timeout while retrieving devices."
+                        _notify("Tailscale", err_msg,
+                                icon="dialog-warning",
+                                copy_content=err_msg)
                     return
                 except OSError as exc:
-                    err_msg = f"Unable to launch tailscale: {exc}"
-                    _notify("Tailscale Error", err_msg,
-                            icon="dialog-error",
-                            copy_content=err_msg)
+                    if notify_on_error:
+                        err_msg = f"Unable to launch tailscale: {exc}"
+                        _notify("Tailscale Error", err_msg,
+                                icon="dialog-error",
+                                copy_content=err_msg)
                     return
 
                 if process.returncode != 0:
-                    error_msg = process.stderr.strip() or "Unknown status error"
-                    _notify("Tailscale Error", f"Status error: {error_msg}",
-                            icon="dialog-error",
-                            copy_content=error_msg)
+                    if notify_on_error:
+                        error_msg = process.stderr.strip() or "Unknown status error"
+                        _notify("Tailscale Error", f"Status error: {error_msg}",
+                                icon="dialog-error",
+                                copy_content=error_msg)
                     return
 
                 try:
                     status = json.loads(process.stdout)
                 except json.JSONDecodeError as exc:
-                    err_msg = f"Invalid JSON response: {exc}"
-                    _notify("Tailscale Error", err_msg,
-                            icon="dialog-error",
-                            copy_content=err_msg)
+                    if notify_on_error:
+                        err_msg = f"Invalid JSON response: {exc}"
+                        _notify("Tailscale Error", err_msg,
+                                icon="dialog-error",
+                                copy_content=err_msg)
                     return
 
                 # Only show peers belonging to the same user (important in shared/corp tailnets)
@@ -207,14 +220,15 @@ class Taildrop:
     def get_devices(cls) -> list:
         now = time.monotonic()
         # If cache is completely empty, fetch synchronously so devices appear on first click
+        # Silencieux : un simple clic droit ne doit jamais notifier.
         if not cls._devices_cache:
-            cls._fetch_devices()
+            cls._fetch_devices(notify_on_error=False)
             return cls._devices_cache
 
         # Stale-while-revalidate: return cache immediately and refresh asynchronously if expired
         if (now - cls._last_cache_time >= cls._CACHE_TTL) and not cls._is_updating:
             cls._is_updating = True
-            threading.Thread(target=cls._fetch_devices, daemon=True).start()
+            threading.Thread(target=lambda: cls._fetch_devices(notify_on_error=False), daemon=True).start()
 
         return cls._devices_cache
 
@@ -224,7 +238,7 @@ class Taildrop:
         cls._last_cache_time = 0.0
         cls._is_updating = True
         _notify("Tailscale", "Refreshing device list…", icon="view-refresh")
-        threading.Thread(target=cls._fetch_devices, daemon=True).start()
+        threading.Thread(target=lambda: cls._fetch_devices(notify_on_error=True), daemon=True).start()
 
     # ---------------------------------------------------------------- receiving
 

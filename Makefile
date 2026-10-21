@@ -1,4 +1,4 @@
-.PHONY: install uninstall deinstall restart
+.PHONY: install uninstall deinstall restart test
 
 EXT_DIR := $(HOME)/.local/share/nautilus-python/extensions
 
@@ -16,3 +16,6 @@ deinstall: uninstall
 restart:
 	-nautilus -q
 	@echo "Nautilus restarted."
+
+test:
+	/usr/bin/python3 -m unittest discover -s tests -v
